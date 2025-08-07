@@ -1,115 +1,139 @@
-import 'dart:async'; // Pour gérer les StreamSubscription et futures
-import 'package:flutter_bloc/flutter_bloc.dart'; // Pour le pattern BLoC
-import 'package:flutter_blue_plus/flutter_blue_plus.dart'; // Pour le Bluetooth
-import 'package:equatable/equatable.dart'; // Pour simplifier la comparaison des objets
+import 'dart:async';
+import 'dart:io';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:equatable/equatable.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 /// --- EVENTS ---
-// Événements déclenchés pour contrôler le BLoC Bluetooth
 
-// Classe abstraite de base pour tous les événements Bluetooth
 abstract class BluetoothEvent extends Equatable {
   @override
-  List<Object?> get props => []; // Pas de propriété dans la base
+  List<Object?> get props => [];
 }
 
-// Événement pour démarrer le scan Bluetooth
 class StartScan extends BluetoothEvent {}
 
-// Événement pour arrêter le scan Bluetooth
 class StopScan extends BluetoothEvent {}
 
-/// --- STATES ---
-// États possibles du BLoC Bluetooth
+class RequestBluetoothPermissions extends BluetoothEvent {}
 
-// Classe abstraite de base pour tous les états Bluetooth
+/// --- STATES ---
+
 abstract class BluetoothState extends Equatable {
   @override
-  List<Object?> get props => []; // Pas de propriété dans la base
+  List<Object?> get props => [];
 }
 
-// État initial (avant le démarrage du scan)
 class BluetoothInitial extends BluetoothState {}
 
-// État indiquant que le scan Bluetooth est en cours
+class BluetoothPermissionDenied extends BluetoothState {}
+
+class BluetoothPermissionGranted extends BluetoothState {}
+
 class BluetoothScanning extends BluetoothState {}
 
-// État indiquant que le scan a réussi avec la liste des appareils détectés
 class BluetoothScanSuccess extends BluetoothState {
-  final List<ScanResult> devices; // Liste des appareils détectés
+  final List<ScanResult> devices;
 
   BluetoothScanSuccess(this.devices);
 
   @override
-  List<Object?> get props => [devices]; // Comparaison sur la liste des appareils
+  List<Object?> get props => [devices];
 }
 
-// État indiquant qu'une erreur est survenue durant le scan
 class BluetoothScanError extends BluetoothState {
-  final String message; // Message d'erreur
+  final String message;
 
   BluetoothScanError(this.message);
 
   @override
-  List<Object?> get props => [message]; // Comparaison sur le message d'erreur
+  List<Object?> get props => [message];
 }
 
 /// --- BLOC ---
-// Logique métier du Bluetooth sous forme de BLoC
 
 class BluetoothBloc extends Bloc<BluetoothEvent, BluetoothState> {
-  final List<ScanResult> _devices = []; // Stockage interne des appareils détectés
-  StreamSubscription<List<ScanResult>>? _scanSubscription; // Abonnement au flux de résultats
+  final List<ScanResult> _devices = [];
+  StreamSubscription<List<ScanResult>>? _scanSubscription;
 
   BluetoothBloc() : super(BluetoothInitial()) {
-    // Association des événements avec leurs handlers
+    on<RequestBluetoothPermissions>(_onRequestBluetoothPermissions);
     on<StartScan>(_onStartScan);
     on<StopScan>(_onStopScan);
   }
 
-  // Gestion du démarrage du scan
-  Future<void> _onStartScan(StartScan event, Emitter<BluetoothState> emit) async {
+  /// --- Demande de permissions ---
+  Future<void> _onRequestBluetoothPermissions(
+      RequestBluetoothPermissions event, Emitter<BluetoothState> emit) async {
     try {
-      _devices.clear(); // Réinitialisation de la liste des appareils
-      emit(BluetoothScanning()); // Émettre l'état scanning
+      if (!Platform.isAndroid) {
+        emit(BluetoothPermissionGranted());
+        return;
+      }
 
-      // Démarrer le scan Bluetooth avec un timeout de 10 secondes
+      // Vérifie et demande toutes les permissions nécessaires
+      Map<Permission, PermissionStatus> statuses = await [
+        Permission.bluetoothScan,
+        Permission.bluetoothConnect,
+        Permission.locationWhenInUse,
+      ].request();
+
+      if (statuses[Permission.bluetoothScan]!.isGranted &&
+          statuses[Permission.bluetoothConnect]!.isGranted &&
+          statuses[Permission.locationWhenInUse]!.isGranted) {
+        emit(BluetoothPermissionGranted());
+        add(StartScan()); // Lancer le scan si tout est ok
+      } else {
+        emit(BluetoothPermissionDenied());
+      }
+    } catch (e) {
+      emit(BluetoothScanError("Erreur lors de la demande de permissions : $e"));
+    }
+  }
+
+  /// --- Démarrage du scan ---
+  Future<void> _onStartScan(
+      StartScan event, Emitter<BluetoothState> emit) async {
+    try {
+      _devices.clear();
+      emit(BluetoothScanning());
+
       await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
 
-      // S'abonner au flux des résultats du scan
       _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
         _devices
-          ..clear() // On vide la liste
-          ..addAll(results); // On ajoute les nouveaux résultats
-        emit(BluetoothScanSuccess(List<ScanResult>.from(_devices))); // Émettre la liste actualisée
+          ..clear()
+          ..addAll(results);
+        emit(BluetoothScanSuccess(List<ScanResult>.from(_devices)));
       });
 
-      // Dès que le scan s'arrête (isScanning devient false), on déclenche l'arrêt du scan
-      FlutterBluePlus.isScanning.where((isScanning) => !isScanning).first.then((_) {
+      FlutterBluePlus.isScanning
+          .where((isScanning) => !isScanning)
+          .first
+          .then((_) {
         add(StopScan());
       });
     } catch (e) {
-      // En cas d'erreur, on émet un état d'erreur avec message
       emit(BluetoothScanError('Erreur lors du scan : $e'));
     }
   }
 
-  // Gestion de l'arrêt du scan
+  /// --- Arrêt du scan ---
   Future<void> _onStopScan(StopScan event, Emitter<BluetoothState> emit) async {
     try {
-      await FlutterBluePlus.stopScan(); // Arrêter le scan
-      await _scanSubscription?.cancel(); // Annuler l'abonnement au flux
-      _scanSubscription = null; // Nettoyer la référence
-      emit(BluetoothScanSuccess(List<ScanResult>.from(_devices))); // Émettre la liste finale
+      await FlutterBluePlus.stopScan();
+      await _scanSubscription?.cancel();
+      _scanSubscription = null;
+      emit(BluetoothScanSuccess(List<ScanResult>.from(_devices)));
     } catch (e) {
-      // En cas d'erreur, émettre l'état d'erreur
       emit(BluetoothScanError('Erreur lors de l’arrêt du scan : $e'));
     }
   }
 
-  // Nettoyage à la fermeture du BLoC
   @override
   Future<void> close() {
-    _scanSubscription?.cancel(); // Annuler l'abonnement si actif
+    _scanSubscription?.cancel();
     return super.close();
   }
 }
